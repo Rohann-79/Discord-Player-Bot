@@ -1,0 +1,281 @@
+import discord
+import yt_dlp
+import os
+import asyncio
+from discord.ext import commands
+from discord import FFmpegOpusAudio
+
+# Load .env variables
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv('discord_token')
+GUILD_ID = discord.Object(id=1334591079101501533)  # Update with your guild ID
+# GUILD_ID = discord.Object(id=os.getenv('guild_token'))
+
+# Set up the bot
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Create voice client dictionary and song queue
+voice_clients = {}
+song_queues = {}
+
+# Set up yt_dlp options for best audio format
+yt_dl_options = {'format': 'bestaudio/best', 'noplaylist': True}
+ytdl = yt_dlp.YoutubeDL(yt_dl_options)
+
+# Set up ffmpeg options for audio filtering
+ffmpeg_options = {
+    'before_options':
+    '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn -filter:a "volume=0.25"'
+}
+
+
+async def handle_rate_limit(response):
+  if response.status_code == 429:
+    try:
+      json_data = response.json()
+      retry_after = json_data['retry_after']
+      print(f"Rate limit exceeded.  Waiting {retry_after} seconds.")
+      await asyncio.sleep(retry_after)
+      return True
+    except KeyError:
+      print("Rate limit exceeded, but no retry_after field found.")
+      return False
+  return False
+
+
+@bot.event
+async def on_ready():
+  print(f'Logged in as {bot.user}')
+  try:
+    # Sync all commands to the guild
+    synced = await bot.tree.sync(guild=GUILD_ID)
+    print(f"Synced {len(synced)} commands to guild {GUILD_ID.id}")
+  except Exception as e:
+    if await handle_rate_limit(e):
+      await on_ready()
+    else:
+      print(f'Error syncing commands: {e}')
+
+
+# Slash command to search YouTube for a song
+@bot.tree.command(
+    name="search",
+    description="Search YouTube for a song and play the first result",
+    guild=GUILD_ID)
+async def search_song(interaction: discord.Interaction, song_title: str):
+  try:
+    await interaction.response.send_message(
+        f"Searching for '{song_title}' on YouTube...")
+    search_url = f"ytsearch:{song_title}"
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(
+        None, lambda: ytdl.extract_info(search_url, download=False))
+
+    if 'entries' in data and len(data['entries']) > 0:
+      song = data['entries'][0]
+      song_url = song['url']
+      title = song['title']
+
+      if interaction.guild.id not in voice_clients or not voice_clients[
+          interaction.guild.id].is_connected():
+        if interaction.user.voice:
+          voice_channel = interaction.user.voice.channel
+          voice_client = await voice_channel.connect()
+          voice_clients[interaction.guild.id] = voice_client
+        else:
+          await interaction.followup.send(
+              "You need to join a voice channel first.")
+          return
+      else:
+        voice_client = voice_clients[interaction.guild.id]
+
+      if interaction.guild.id not in song_queues:
+        song_queues[interaction.guild.id] = []
+
+      song_queues[interaction.guild.id].append({
+          'url': song_url,
+          'title': title
+      })
+
+      if not voice_client.is_playing() and not voice_client.is_paused():
+        await play_next_song(interaction.guild.id, voice_client)
+
+      embed = discord.Embed(title=f"Added to Queue: {title}",
+                            description=f"Playing from YouTube: {song_url}",
+                            color=discord.Color.blue())
+      await interaction.followup.send(embed=embed)
+
+    else:
+      await interaction.followup.send(f"No results found for '{song_title}'.")
+
+  except Exception as e:
+    await interaction.followup.send(f"Error: {e}")
+
+
+# Slash command to play song directly using URL
+@bot.tree.command(name="play",
+                  description="Play a song from a direct YouTube link",
+                  guild=GUILD_ID)
+async def play_song(interaction: discord.Interaction, song_url: str):
+  try:
+    await interaction.response.send_message(
+        f"Playing song from URL: {song_url}")
+
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(
+        None, lambda: ytdl.extract_info(song_url, download=False))
+
+    title = data['title']
+
+    # Extract the best audio URL from yt-dlp's data
+    if 'formats' in data:
+      audio_url = None
+      for format in data['formats']:
+        if format.get('acodec') != 'none' and format.get('vcodec') == 'none':
+          audio_url = format['url']
+          break
+
+      if audio_url is None:
+        await interaction.followup.send(
+            "No audio format found for the provided URL.")
+        return
+
+      # Check if the bot is connected to a voice channel
+      if interaction.guild.id not in voice_clients or not voice_clients[
+          interaction.guild.id].is_connected():
+        if interaction.user.voice:
+          voice_channel = interaction.user.voice.channel
+          voice_client = await voice_channel.connect()
+          voice_clients[interaction.guild.id] = voice_client
+        else:
+          await interaction.followup.send(
+              "You need to join a voice channel first.")
+          return
+      else:
+        voice_client = voice_clients[interaction.guild.id]
+
+      # Add the song to the queue
+      if interaction.guild.id not in song_queues:
+        song_queues[interaction.guild.id] = []
+
+      song_queues[interaction.guild.id].append({
+          'url': audio_url,
+          'title': title
+      })
+
+      # Play the song if nothing is currently playing
+      if not voice_client.is_playing() and not voice_client.is_paused():
+        await play_next_song(interaction.guild.id, voice_client)
+
+      embed = discord.Embed(title=f"Added to Queue: {title}",
+                            description=f"Playing from YouTube: {song_url}",
+                            color=discord.Color.blue())
+      await interaction.followup.send(embed=embed)
+
+    else:
+      await interaction.followup.send(
+          f"Could not extract audio from the provided URL.")
+
+  except Exception as e:
+    await interaction.followup.send(f"Error: {e}")
+
+
+# Function to play the next song in the queue
+async def play_next_song(guild_id, voice_client):
+  if guild_id in song_queues and len(song_queues[guild_id]) > 0:
+    next_song = song_queues[guild_id].pop(0)
+    song_url = next_song['url']
+    title = next_song['title']
+    player = FFmpegOpusAudio(song_url, **ffmpeg_options)
+    voice_client.play(player,
+                      after=lambda e: asyncio.run_coroutine_threadsafe(
+                          play_next_song(guild_id, voice_client), bot.loop))
+
+    embed = discord.Embed(title=f"Now Playing: {title}",
+                          description=f"Playing from YouTube: {song_url}",
+                          color=discord.Color.blue())
+    await voice_client.guild.text_channels[0].send(embed=embed)
+
+
+# Slash command to pause the current song
+@bot.tree.command(name="pause",
+                  description="Pause the current song",
+                  guild=GUILD_ID)
+async def pause_song(interaction: discord.Interaction):
+  voice_client = voice_clients.get(interaction.guild.id)
+
+  if voice_client and voice_client.is_playing():
+    voice_client.pause()
+    await interaction.response.send_message("Song paused.")
+  else:
+    await interaction.response.send_message("No song is currently playing.")
+
+
+# Slash command to resume the paused song
+@bot.tree.command(name="resume",
+                  description="Resume the paused song",
+                  guild=GUILD_ID)
+async def resume_song(interaction: discord.Interaction):
+  voice_client = voice_clients.get(interaction.guild.id)
+
+  if voice_client and voice_client.is_paused():
+    voice_client.resume()
+    await interaction.response.send_message("Song resumed.")
+  else:
+    await interaction.response.send_message("No song is currently paused.")
+
+
+# Slash command to stop the current song and disconnect the bot
+@bot.tree.command(
+    name="stop",
+    description="Stop the current song and disconnect from the voice channel",
+    guild=GUILD_ID)
+async def stop_song(interaction: discord.Interaction):
+  voice_client = voice_clients.get(interaction.guild.id)
+
+  if voice_client:
+    voice_client.stop()
+    await voice_client.disconnect()
+    del voice_clients[interaction.guild.id]
+    del song_queues[interaction.guild.id]
+    await interaction.response.send_message(
+        "Stopped the current song and disconnected.")
+  else:
+    await interaction.response.send_message(
+        "The bot is not connected to a voice channel.")
+
+
+# Slash command to show the current song queue
+@bot.tree.command(name="queue",
+                  description="Show the current song queue",
+                  guild=GUILD_ID)
+async def show_queue(interaction: discord.Interaction):
+  voice_client = voice_clients.get(interaction.guild.id)
+  if not voice_client:
+    await interaction.response.send_message(
+        "The bot is not connected to a voice channel.")
+    return
+
+  if interaction.guild.id not in song_queues or len(
+      song_queues[interaction.guild.id]) == 0:
+    await interaction.response.send_message("The queue is empty.")
+    return
+
+  queue_list = "\n".join([
+      f"{index + 1}. {song['title']}"
+      for index, song in enumerate(song_queues[interaction.guild.id])
+  ])
+  embed = discord.Embed(title="Current Queue",
+                        description=queue_list,
+                        color=discord.Color.blue())
+  await interaction.response.send_message(embed=embed)
+
+
+# Run the bot
+bot.run(TOKEN)
